@@ -3,6 +3,13 @@ uuid = "dc57d79c-b8fb-49ad-9bfa-14683d7142d1"
 authors = ["Anshul Singhvi <anshulsinghvi@gmail.com> and contributors"]
 version = "0.1.0-DEV"
 
+[deps]
+GeoFormatTypes = "68eda718-8dee-11e9-39e7-89f7f65f511f"
+GeoInterface = "cf35fbd7-0cd7-5166-be24-54bfbe79505f"
+SQLite = "0aa819cd-b072-5ff4-a722-6bc24af294d9"
+Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
+WellKnownGeometry = "0f680547-7be7-4555-8820-bb198eeb646b"
+
 [compat]
 julia = "1"
 
