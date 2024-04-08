@@ -34,37 +34,57 @@ end
 # Get the various tables we'll need.
 
 function _get_geometry_table(source, table_name, table_type, srs_id, crs_table)
-    if table_type != "features"
-        @warn """
-        Trying to parse table with type other than `features` is not supported by GeoPackage.jl.
-        Got table type: $table_type
-        """
-        return DataFrame()
+    global to
+    @timeit to "Table retrieval" begin
+        if table_type != "features"
+            @warn """
+            Trying to parse table with type other than `features` is not supported by GeoPackage.jl.
+            Got table type: $table_type
+            """
+            return DataFrame()
+        end
+        table_query = "SELECT * FROM $table_name;"
+        table_query_result = DBInterface.execute(source, table_query)
+        @timeit to "Materialization" result = DataFrame(table_query_result)
     end
-    table_query = "SELECT * FROM $table_name;"
-    table_query_result = DBInterface.execute(source, table_query)
-    result = DataFrame(table_query_result)
-    result.geom = parse_geopkg_wkb.(result.geom; crs_table = crs_table)
+    @timeit to "WKB parsing" begin
+        result.geom = parse_geopkg_wkb.(result.geom; crs_table = crs_table)
+    end
     DataFrames.metadata!(result, "GeoPackage.jl SRS data", crs_table)
     DataFrames.metadata!(result, "GeoPackage.jl default SRS", srs_id)
     return result
 end
 
 function _get_geometry_tables(source::SQLite.DB)::Vector{DataFrame}
+    global to
+    @timeit to "General queries" begin
     # First, we obtain the CRS reference table.
+    @timeit to "CRS table" begin
+        @timeit to "Query" begin
     crs_table = DBInterface.execute(source, "SELECT * FROM gpkg_spatial_ref_sys;")
+        end
+        @timeit to "Materialization" begin
     crs_df = DataFrame(crs_table)
+        end
+    @timeit to "CRS parsing" begin
     crs_df[!, :gft] = _crs_row_to_gft.(eachrow(crs_df))
+    end
+    end
     # # Next, we obtain the table of extensions.  This is not actually useful yet, so is commented out.
     # extensions_table = DBInterface.execute(source, "SELECT * FROM gpkg_extensions;")
     # extensions_materialized = Tables.columntable(extensions_table)
     # Next, we obtain the table of contents.
+    @timeit to "Contents table" begin
     contents_table = DBInterface.execute(source, "SELECT * FROM gpkg_contents;")
+    end
+    end
     # We can use this to get the names of the tables we need to read.
     function _ggt(row)
         _get_geometry_table(source, row[:table_name], row[:data_type], row[:srs_id], crs_df)
     end
-    geometry_tables = map(_ggt, Tables.rows(contents_table))
+    @timeit to "Get geometry tables" begin
+        geometry_tables = map(_ggt, Tables.rows(contents_table))
+    end
     return geometry_tables
 end
 _get_geometry_tables(file::String) = _get_geometry_tables(SQLite.DB(file))
@@ -134,8 +154,44 @@ end
 
 
 # @b _get_geometry_tables(joinpath(dirname(@__DIR__), "test", "data", "polygon.gpkg")) seconds=3 # 313 μs
+# ────────────────────────────────────────────────────────────────────────────────
+#                                         Time                    Allocations      
+#                                ───────────────────────   ────────────────────────
+#        Tot / % measured:            4.65s /  55.8%            383MiB /  94.9%    
+#
+#  Section               ncalls     time    %tot     avg     alloc    %tot      avg
+#  ────────────────────────────────────────────────────────────────────────────────
+#  General queries        7.08k    1.69s   65.1%   239μs    103MiB   28.3%  14.9KiB
+#    CRS table            7.08k    1.57s   60.3%   221μs   79.2MiB   21.8%  11.4KiB
+#      Query              7.08k    1.29s   49.5%   182μs   17.7MiB    4.9%  2.56KiB
+#      Materialization    7.08k    256ms    9.9%  36.2μs   56.1MiB   15.4%  8.12KiB
+#      CRS parsing        7.08k   20.0ms    0.8%  2.82μs   5.30MiB    1.5%     784B
+#    Contents table       7.08k    124ms    4.8%  17.5μs   23.7MiB    6.5%  3.42KiB
+#  Get geometry tables    7.08k    905ms   34.9%   128μs    261MiB   71.7%  37.8KiB
+#    WKB parsing          7.08k    554ms   21.3%  78.2μs    216MiB   59.3%  31.2KiB
+#    Table retrieval      7.08k    121ms    4.7%  17.1μs   34.5MiB    9.5%  4.99KiB
+#      Materialization    7.08k   65.6ms    2.5%  9.27μs   20.9MiB    5.7%  3.02KiB
+#  ────────────────────────────────────────────────────────────────────────────────
 # @b GeoDataFrames.read(joinpath(dirname(@__DIR__), "test", "data", "polygon.gpkg")) seconds=3   # 781 μs
 
 # @b _get_geometry_tables("/Users/anshul/git/vector-benchmark/data/points.gpkg") seconds=10 # 894 ms
+# ────────────────────────────────────────────────────────────────────────────────
+# Time                    Allocations      
+# ───────────────────────   ────────────────────────
+# Tot / % measured:             142s /   7.8%           3.26GiB /  99.3%    
+#
+# Section               ncalls     time    %tot     avg     alloc    %tot      avg
+# ────────────────────────────────────────────────────────────────────────────────
+# Get geometry tables       12    11.1s   99.9%   926ms   3.23GiB  100.0%   276MiB
+# WKB parsing             12    6.10s   54.9%   508ms   1.82GiB   56.4%   156MiB
+# Table retrieval         12    5.01s   45.1%   417ms   1.41GiB   43.6%   120MiB
+# Materialization       12    5.01s   45.1%   417ms   1.41GiB   43.6%   120MiB
+# General queries           12   7.39ms    0.1%   616μs    182KiB    0.0%  15.2KiB
+# CRS table               12   6.94ms    0.1%   578μs    140KiB    0.0%  11.6KiB
+# Query                 12   5.26ms    0.0%   439μs   30.8KiB    0.0%  2.56KiB
+# Materialization       12   1.47ms    0.0%   123μs   97.4KiB    0.0%  8.12KiB
+# CRS parsing           12    190μs    0.0%  15.9μs   9.19KiB    0.0%     784B
+# Contents table          12    445μs    0.0%  37.1μs   41.1KiB    0.0%  3.42KiB
+# ────────────────────────────────────────────────────────────────────────────────
 # @b GeoDataFrames.read("/Users/anshul/git/vector-benchmark/data/points.gpkg") seconds=10 # 195 ms
 # @b GO.tuples(GeoDataFrames.read("/Users/anshul/git/vector-benchmark/data/points.gpkg").geom) seconds=10 # 213 ms
