@@ -12,6 +12,8 @@ WellKnownGeometry = "0f680547-7be7-4555-8820-bb198eeb646b"
 
 [compat]
 WellKnownGeometry = "0.2"
+Tables = "1"
+GeoInterface = "1"
 julia = "1"
 
 [extras]
