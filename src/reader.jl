@@ -1,7 +1,22 @@
+#=
+# The reader
+
+This file contains the code for reading GeoPackage files.
+
+It uses the DBInterface.jl and SQLite.jl packages to read the GeoPackage file as a SQLite database,
+and then reads the tables in the GeoPackage file into DataFrames.
+
+Finally, it converts the GeoPackage-WKB (Well-Known Binary) representations of the geometries into GeoInterface geometries.
+=#
+
 using SQLite, GeoInterface, Tables
 import GeoInterface as GI, GeoFormatTypes as GFT, WellKnownGeometry as WKG
 
 using DataFrames
+
+struct __GeoPackageFile
+    source::SQLite.DB
+end
 
 #=
 
@@ -11,22 +26,14 @@ using DataFrames
 =#
 
 # Load the GeoPackage file as a SQLite database
-source = SQLite.DB(joinpath(dirname(@__DIR__), "test", "data", "polygon.gpkg"))
-source = SQLite.DB("/Users/anshul/git/vector-benchmark/data/points.gpkg")
+# ```julia
+# source = SQLite.DB(joinpath(dirname(@__DIR__), "test", "data", "polygon.gpkg"))
+# source = SQLite.DB("/Users/anshul/git/vector-benchmark/data/points.gpkg")
+# ```
+
 # Get the various tables we'll need.
-crs_table = DBInterface.execute(source, "SELECT * FROM gpkg_spatial_ref_sys;")
-crs_df = DataFrame(crs_table)
 
-extensions_table = DBInterface.execute(source, "SELECT * FROM gpkg_extensions;")
-extensions_materialized = Tables.columntable(extensions_table)
-
-contents_table = DBInterface.execute(source, "SELECT * FROM gpkg_contents;")
-
-geometry_tables = map(Tables.rows(contents_table)) do row
-    table_name = row.table_name
-    table_type = row.data_type
-    srs_id = row.srs_id
-    crs_data = crs_df[findfirst(==(srs_id), crs_df.srs_id), :]
+function _get_geometry_table(source, table_name, table_type, srs_id, crs_table)
     if table_type != "features"
         @warn """
         Trying to parse table with type other than `features` is not supported by GeoPackage.jl.
@@ -36,41 +43,42 @@ geometry_tables = map(Tables.rows(contents_table)) do row
     end
     table_query = "SELECT * FROM $table_name;"
     table_query_result = DBInterface.execute(source, table_query)
-    DataFrame(table_query_result)
+    result = DataFrame(table_query_result)
+    result.geom = parse_geopkg_wkb.(result.geom; crs_table = crs_table)
+    DataFrames.metadata!(result, "GeoPackage.jl SRS data", crs_table)
+    DataFrames.metadata!(result, "GeoPackage.jl default SRS", srs_id)
+    return result
 end
 
-geometry_tables
+function _get_geometry_tables(source::SQLite.DB)::Vector{DataFrame}
+    # First, we obtain the CRS reference table.
+    crs_table = DBInterface.execute(source, "SELECT * FROM gpkg_spatial_ref_sys;")
+    crs_df = DataFrame(crs_table)
+    crs_df[!, :gft] = _crs_row_to_gft.(eachrow(crs_df))
+    # # Next, we obtain the table of extensions.  This is not actually useful yet, so is commented out.
+    # extensions_table = DBInterface.execute(source, "SELECT * FROM gpkg_extensions;")
+    # extensions_materialized = Tables.columntable(extensions_table)
+    # Next, we obtain the table of contents.
+    contents_table = DBInterface.execute(source, "SELECT * FROM gpkg_contents;")
+    # We can use this to get the names of the tables we need to read.
+    function _ggt(row)
+        _get_geometry_table(source, row[:table_name], row[:data_type], row[:srs_id], crs_df)
+    end
+    geometry_tables = map(_ggt, Tables.rows(contents_table))
+    return geometry_tables
+end
+_get_geometry_tables(file::String) = _get_geometry_tables(SQLite.DB(file))
 
-polytable = first(geometry_tables)
-poly_wkb = polytable.geom[1]
-
-# Check that the magic number is correct
-@assert poly_wkb[1] == 0x47 && poly_wkb[2] == 0x50 "The magic bits for a GeoPackage WKB are not present.  Expected `[0x47, 0x50]`, got `$(poly_wkb[1:2])`."
-# Get version and flag bytes
-version = poly_wkb[3]
-flag_byte = poly_wkb[4]
-# Expand the flag byte into its components
-is_extended_gpkg = (flag_byte & 0b00100000) == 0b00100000
-is_empty =( flag_byte & 0b0001000) == 0b0001000
-envelope_size_byte = flag_byte << 4 >> 5
-is_little_endian = (flag_byte & 0b00000001) == 0b00000001
-
-# Calculate envelope size according to the definition in the GeoPackage spec
-envelope_size = if envelope_size_byte == 0
-    0
-elseif envelope_size_byte == 1
-    32
-elseif envelope_size_byte == 2
-    48
-elseif envelope_size_byte == 3
-    48
-elseif envelope_size_byte == 4
-    64
-else
-    error("Invalid envelope size byte: $envelope_size_byte.  Specifically, the number evaluated to $(envelope_size_byte), which is in the invalid region between 5 and 7.")
+function _crs_row_to_gft(crs_row)
+    if crs_row[:organization] == "EPSG"
+        GFT.EPSG(crs_row[:organization_coordsys_id])
+    else
+        GFT.WellKnownText(GFT.CRS(), crs_row[:definition])
+    end
 end
 
-function parse_envelope(wkb::Vector{UInt8})
+
+function parse_envelope(wkb::Vector{UInt8},)
     envelope = wkb[9:8+envelope_size]
     x_min = reinterpret(Float64, envelope[1:8])
     y_min = reinterpret(Float64, envelope[9:16])
@@ -79,24 +87,55 @@ function parse_envelope(wkb::Vector{UInt8})
     return (x_min, y_min, x_max, y_max)
 end
 
+function parse_geopkg_wkb(wkb::Vector{UInt8}; crs_table)
+    # Check that the magic number is correct
+    @assert wkb[1] == 0x47 && wkb[2] == 0x50 "The magic bits for a GeoPackage WKB are not present.  Expected `[0x47, 0x50]`, got `$(wkb[1:2])`."
+    # Get version and flag bytes
+    version = wkb[3]
+    flag_byte = wkb[4]
+    # Expand the flag byte into its components
+    is_extended_gpkg = (flag_byte & 0b00100000) == 0b00100000 # is the GeoPackage extended?
+    is_empty = (flag_byte & 0b0001000) == 0b0001000           # is the geometry empty? TODO: short-circuit here, return an empty geom.  May be a NaN geom instead.
+    envelope_size_byte = flag_byte << 4 >> 5                  # what is the category of the envelope?  See note above.
+    is_little_endian = (flag_byte & 0b00000001) == 0b00000001 # is the WKB little-endian?  If not we can't yet handle it in native Julia.
 
-# Obtain the SRS ID
-srs_id = only(reinterpret(Int32, poly_wkb[5:8]))
-# Look this ID up and convert it into a CRS object from GeoFormatTypes.
-crs_row = crs_df[findfirst(==(srs_id), crs_df.srs_id), :]
-crs_obj = if crs.organization == "EPSG"
-    GFT.EPSG(crs_row.organization_coordsys_id)
-else
-    GFT.WellKnownText(GFT.CRS(), crs_row.definition)
+    # Calculate envelope size according to the definition in the GeoPackage spec
+    envelope_size = if envelope_size_byte == 0
+        0
+    elseif envelope_size_byte == 1
+        32
+    elseif envelope_size_byte == 2
+        48
+    elseif envelope_size_byte == 3
+        48
+    elseif envelope_size_byte == 4
+        64
+    else
+        error("Invalid envelope size byte: $envelope_size_byte.  Specifically, the number evaluated to $(envelope_size_byte), which is in the invalid region between 5 and 7.")
+    end
+    # Obtain the SRS ID
+    srs_id = only(reinterpret(Int32, wkb[5:8]))
+    # Look this ID up and convert it into a CRS object from `GeoFormatTypes`.
+    crs_row = findfirst(==(srs_id), crs_table.srs_id)
+    # We've preprocessed all available CRSs in the geopackage file into 
+    # GeoFormatTypes objects, so we can just index into that table.
+    crs_obj = crs_table[crs_row, :gft]
+    # Calculate the number of bytes in the GeoPackage spec header.
+    # This is dynamic, as it depends on the envelope size.
+    header_length = 4 #= length of original flags =# + 
+                    4 #= length of CRS indicator as Int32 =# + 
+                    envelope_size #= size of envelope as given =#
+    # We index into the WKB to get the actual geometry.
+    # We need to start from the byte _after_ the header, i.e., `header_length+1`.
+    final_geom = GO.tuples(GFT.WellKnownBinary(GFT.Geom(), wkb[(header_length+1):end]); crs = crs_obj)
+    return final_geom
 end
-# 
-header_length = 4 #= length of original flags =# + 
-                4 #= length of CRS indicator as Int32 =# + 
-                envelope_size #= size of envelope as given =#
 
-ArchGDAL.fromWKB(poly_wkb[header_length+1:end]) #|> GI.trait
 
-GFT.WellKnownBinary(GFT.Geom(), poly_wkb[(header_length):end]) |> GI.trait
 
-point_x = only(reinterpret(Float64, poly_wkb[end-15:end-8]))
-point_y = only(reinterpret(Float64, poly_wkb[end-7:end]))
+# @b _get_geometry_tables(joinpath(dirname(@__DIR__), "test", "data", "polygon.gpkg")) seconds=3 # 313 μs
+# @b GeoDataFrames.read(joinpath(dirname(@__DIR__), "test", "data", "polygon.gpkg")) seconds=3   # 781 μs
+
+# @b _get_geometry_tables("/Users/anshul/git/vector-benchmark/data/points.gpkg") seconds=10 # 894 ms
+# @b GeoDataFrames.read("/Users/anshul/git/vector-benchmark/data/points.gpkg") seconds=10 # 195 ms
+# @b GO.tuples(GeoDataFrames.read("/Users/anshul/git/vector-benchmark/data/points.gpkg").geom) seconds=10 # 213 ms
