@@ -17,6 +17,7 @@ GeoFormatTypes = "0.4"
 GeoInterface = "1"
 SQLite = "1"
 Tables = "1"
+TimerOutputs = "0.5"
 WellKnownGeometry = "0.2"
 julia = "1"
 
