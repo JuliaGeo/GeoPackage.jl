@@ -19,6 +19,21 @@ struct __GeoPackageFile
     source::SQLite.DB
 end
 
+"""
+This dict encodes a lookup from geometry type strings as defined in 
+
+"""
+const GEOMETRY_TYPE_LOOKUP = Dict{String, Type}(
+    "POINT" => GI.PointTrait,
+    "LINESTRING" => GI.LineStringTrait,
+    "POLYGON" => GI.PolygonTrait,
+    "MULTIPOINT" => GI.MultiPointTrait,
+    "MULTILINESTRING" => GI.MultiLineStringTrait,
+    "MULTIPOLYGON" => GI.MultiPolygonTrait,
+    "GEOMETRYCOLLECTION" => GI.GeometryCollectionTrait,
+    "GEOMETRY" => GI.AbstractGeometryTrait
+)
+
 #=
 
 ## Notes on working with SQLite.jl
@@ -50,7 +65,38 @@ function get_crs_table(source)
     return crs_df
 end
 
-function _get_geometry_table(source, table_name, geometry_column, srs_id, crs_table)
+function get_geometry_table(source, table_name, crs_table = get_crs_table(source))
+    global to
+    @timeit to "Table retrieval" begin
+        table_query = """
+        SELECT gpkg_geometry_columns.column_name, gpkg_geometry_columns.geometry_type_name, gpkg_contents.srs_id
+        FROM gpkg_geometry_columns
+        LEFT JOIN gpkg_contents ON gpkg_geometry_columns.table_name = gpkg_contents.table_name;
+        """
+        table_query_result = DBInterface.execute(source, table_query)
+        @timeit to "Materialization" result = first(table_query_result)
+    end
+    geometry_type = GEOMETRY_TYPE_LOOKUP[result[:geometry_type_name]]
+    return _get_geometry_table(geometry_type, source, table_name, result[:column_name], result[:srs_id], crs_table)
+end
+
+function _get_geometry_table(geometry_type::Type{T}, source, table_name, geometry_column, srs_id, crs_table) where T <: GI.AbstractTrait
+    global to
+    @timeit to "Table retrieval" begin
+        table_query = "SELECT * FROM $table_name;"
+        table_query_result = DBInterface.execute(source, table_query)
+        @timeit to "Materialization" result = DataFrame(table_query_result)
+    end
+
+    @timeit to "WKB parsing" begin
+        result[!, geometry_column] = parse_geopkg_wkb.(result[!, geometry_column]; crs_table = crs_table)
+    end
+    DataFrames.metadata!(result, "GeoPackage.jl SRS data", crs_table)
+    DataFrames.metadata!(result, "GeoPackage.jl default SRS", srs_id)
+    return result
+end
+
+function _get_geometry_table(geometry_type::Type{GI.PointTrait}, source, table_name, geometry_column, srs_id, crs_table)
     global to
     @timeit to "Table retrieval" begin
         table_query = "SELECT * FROM $table_name;"
@@ -159,7 +205,49 @@ function parse_geopkg_wkb(wkb::Vector{UInt8}; crs_table)
     return final_geom
 end
 
-
+function _easy_get_point(wkb::Vector{UInt8})
+     # Check that the magic number is correct
+     @assert wkb[1] == 0x47 && wkb[2] == 0x50 "The magic bits for a GeoPackage WKB are not present.  Expected `[0x47, 0x50]`, got `$(wkb[1:2])`."
+     # Get version and flag bytes
+     version = wkb[3]
+     flag_byte = wkb[4]
+     # Expand the flag byte into its components
+     is_extended_gpkg = (flag_byte & 0b00100000) == 0b00100000 # is the GeoPackage extended?
+     is_empty = (flag_byte & 0b0001000) == 0b0001000           # is the geometry empty? TODO: short-circuit here, return an empty geom.  May be a NaN geom instead.
+     envelope_size_byte = flag_byte << 4 >> 5                  # what is the category of the envelope?  See note above.
+     is_little_endian = (flag_byte & 0b00000001) == 0b00000001 # is the WKB little-endian?  If not we can't yet handle it in native Julia.
+ 
+     # Calculate envelope size according to the definition in the GeoPackage spec
+     envelope_size = if envelope_size_byte == 0
+         0
+     elseif envelope_size_byte == 1
+         32
+     elseif envelope_size_byte == 2
+         48
+     elseif envelope_size_byte == 3
+         48
+     elseif envelope_size_byte == 4
+         64
+     else
+         error("Invalid envelope size byte: $envelope_size_byte.  Specifically, the number evaluated to $(envelope_size_byte), which is in the invalid region between 5 and 7.")
+     end
+     # Obtain the SRS ID
+     srs_id = only(reinterpret(Int32, wkb[5:8]))
+     # Look this ID up and convert it into a CRS object from `GeoFormatTypes`.
+     crs_row = findfirst(==(srs_id), crs_table.srs_id)
+     # We've preprocessed all available CRSs in the geopackage file into 
+     # GeoFormatTypes objects, so we can just index into that table.
+     crs_obj = crs_table[crs_row, :gft]
+     # Calculate the number of bytes in the GeoPackage spec header.
+     # This is dynamic, as it depends on the envelope size.
+     header_length = 4 #= length of original flags =# + 
+                     4 #= length of CRS indicator as Int32 =# + 
+                     envelope_size #= size of envelope as given =#
+     # We index into the WKB to get the actual geometry.
+     # We need to start from the byte _after_ the header, i.e., `header_length+1`.
+     final_geom = GI.Point(reinterpret(Float64, wkb[(header_length+1+5):end]); crs = crs_obj)
+     return final_geom
+end
 
 # @b _get_geometry_tables(joinpath(dirname(@__DIR__), "test", "data", "polygon.gpkg")) seconds=3 # 313 μs
 # ────────────────────────────────────────────────────────────────────────────────
