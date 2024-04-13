@@ -50,78 +50,56 @@ const GEOMETRY_TYPE_LOOKUP = Dict{String, Type}(
 # Get the various tables we'll need.
 
 function get_crs_table(source)
-    global to
-    @timeit to "CRS table" begin
-        @timeit to "Query" begin
-            crs_table = DBInterface.execute(source, "SELECT * FROM gpkg_spatial_ref_sys;")
-        end
-        @timeit to "Materialization" begin
-            crs_df = DataFrame(crs_table)
-        end
-        @timeit to "CRS parsing" begin
-            crs_df[!, :gft] = _crs_row_to_gft.(eachrow(crs_df))
-        end
-    end
+    crs_table = DBInterface.execute(source, "SELECT * FROM gpkg_spatial_ref_sys;")
+    crs_df = DataFrame(crs_table)
+    crs_df[!, :gft] = _crs_row_to_gft.(eachrow(crs_df))
     return crs_df
 end
 
 function get_geometry_table(source, table_name, crs_table = get_crs_table(source))
-    global to
-    @timeit to "Table retrieval" begin
-        table_query = """
-        SELECT gpkg_geometry_columns.column_name, gpkg_geometry_columns.geometry_type_name, gpkg_contents.srs_id
-        FROM gpkg_geometry_columns
-        LEFT JOIN gpkg_contents ON gpkg_geometry_columns.table_name = gpkg_contents.table_name;
-        """
-        table_query_result = DBInterface.execute(source, table_query)
-        @timeit to "Materialization" result = first(table_query_result)
-    end
+    table_query = """
+    SELECT gpkg_geometry_columns.column_name, gpkg_geometry_columns.geometry_type_name, gpkg_contents.srs_id
+    FROM gpkg_geometry_columns
+    LEFT JOIN gpkg_contents ON gpkg_geometry_columns.table_name = gpkg_contents.table_name;
+    """
+    table_query_result = DBInterface.execute(source, table_query)
+    result = first(table_query_result)
     geometry_type = GEOMETRY_TYPE_LOOKUP[result[:geometry_type_name]]
     return _get_geometry_table(geometry_type, source, table_name, result[:column_name], result[:srs_id], crs_table)
 end
 
 function _get_geometry_table(geometry_type::Type{T}, source, table_name, geometry_column, srs_id, crs_table) where T <: GI.AbstractTrait
-    global to
-    @timeit to "Table retrieval" begin
-        table_query = "SELECT * FROM $table_name;"
-        table_query_result = DBInterface.execute(source, table_query)
-        @timeit to "Materialization" result = DataFrame(table_query_result)
-    end
+    table_query = "SELECT * FROM $table_name;"
+    table_query_result = DBInterface.execute(source, table_query)
+    result = DataFrame(table_query_result)
 
-    @timeit to "WKB parsing" begin
-        result[!, geometry_column] = parse_geopkg_wkb.(result[!, geometry_column]; crs_table = crs_table)
-    end
+    result[!, geometry_column] = parse_geopkg_wkb.(result[!, geometry_column]; crs_table = crs_table)
     DataFrames.metadata!(result, "GeoPackage.jl SRS data", crs_table)
     DataFrames.metadata!(result, "GeoPackage.jl default SRS", srs_id)
     return result
 end
 
 function _get_geometry_table(geometry_type::Type{GI.PointTrait}, source, table_name, geometry_column, srs_id, crs_table)
-    global to
-    @timeit to "Table retrieval" begin
-        table_query = "SELECT * FROM $table_name;"
-        table_query_result = DBInterface.execute(source, table_query)
-        @timeit to "Materialization" result = DataFrame(table_query_result)
-    end
 
-    @timeit to "WKB parsing" begin
-        result[!, geometry_column] = parse_geopkg_wkb.(result[!, geometry_column]; crs_table = crs_table)
-    end
+    table_query = "SELECT * FROM $table_name;"
+    table_query_result = DBInterface.execute(source, table_query)
+    result = DataFrame(table_query_result)
+
+
+    result[!, geometry_column] = parse_geopkg_wkb.(result[!, geometry_column]; crs_table = crs_table)
+
     DataFrames.metadata!(result, "GeoPackage.jl SRS data", crs_table)
     DataFrames.metadata!(result, "GeoPackage.jl default SRS", srs_id)
     return result
 end
 
 function _get_geometry_tables(source::SQLite.DB)::Vector{DataFrame}
-    global to
-    @timeit to "General queries" begin
     # First, we obtain the CRS reference table.
     crs_df = get_crs_table(source)
     # # Next, we obtain the table of extensions.  This is not actually useful yet, so is commented out.
     # extensions_table = DBInterface.execute(source, "SELECT * FROM gpkg_extensions;")
     # extensions_materialized = Tables.columntable(extensions_table)
     # Next, we obtain the table of contents.
-    @timeit to "Contents table" begin
     contents_table = DBInterface.execute(
         source, 
         """
@@ -130,15 +108,11 @@ function _get_geometry_tables(source::SQLite.DB)::Vector{DataFrame}
             LEFT JOIN gpkg_contents ON gpkg_geometry_columns.table_name = gpkg_contents.table_name;
         """
         )
-    end
-    end
     # We can use this to get the names of the tables we need to read.
     function _ggt(row)
-        _get_geometry_table(source, row[:table_name], row[:column_name], row[:srs_id], crs_df)
+        _get_geometry_table(GI.AbstractGeometryTrait, source, row[:table_name], row[:column_name], row[:srs_id], crs_df)
     end
-    @timeit to "Get geometry tables" begin
-        geometry_tables = map(_ggt, filter(row -> Tables.getcolumn(row, :data_type) == "features", Tables.rowtable(contents_table) |> collect))
-    end
+    geometry_tables = map(_ggt, filter(row -> Tables.getcolumn(row, :data_type) == "features", Tables.rowtable(contents_table) |> collect))
     return geometry_tables
 end
 _get_geometry_tables(file::String) = _get_geometry_tables(SQLite.DB(file))
