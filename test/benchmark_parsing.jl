@@ -1,6 +1,7 @@
 import GeoFormatTypes as GFT, WellKnownGeometry as WKG, GeoInterface as GI
 
 db = SQLite.DB("/Users/anshul/git/vector-benchmark/data/points.gpkg")
+db = SQLite.DB("/Users/anshul/git/vector-benchmark/data/polygon.gpkg")
 
 crs_table = get_crs_table(db)
 
@@ -17,6 +18,7 @@ geoms_table = Tables.columntable(DBInterface.execute(db, "SELECT $(contents_df[1
 geoms = geoms_table.geom
 
 tups = tuple.(rand(300_000), rand(300_000))
+tups = tuple.(rand(3000), rand(3000))
 
 geoms = GFT.val.(WKG.getwkb.(GI.Point.(tups)))
 
@@ -60,7 +62,7 @@ end
 #  Memory estimate: 4.58 MiB, allocs estimate: 2.
 
 ls = GI.LineString(map((geoms)) do geom
-    only(reinterpret(Tuple{Float64, Float64}, view(geom, (8+1+5):length(geom)))) # this should be 5+1 if we are parsing from WKB
+    only(reinterpret(GI.Point{false, false, Makie.Point{2, Float64}, Nothing}, view(geom, (1+5):length(geom)))) # this should be 5+1 if we are parsing from WKB
 end)
 
 ls_as_wkb = GFT.val(WKG.getwkb(ls))
@@ -69,7 +71,7 @@ ls_as_wkb = GFT.val(WKG.getwkb(ls))
 @benchmark GI.coordinates(GFT.WellKnownBinary(GFT.Geom(), $ls_as_wkb))
 
 # Parsing approach 2 - reduce to reinterpret
-@benchmark reinterpret(Tuple{Float64, Float64}, view($ls_as_wkb, (1+4+4+1):length($ls_as_wkb)))
+@benchmark reinterpret(GI.Point{false, false, Makie.Point{2, Float64}, Nothing}, view($ls_as_wkb, (1+4+4+1):length($ls_as_wkb)))
 # This is 2 ns without collect, 200 ns with collect.
 
 # BenchmarkTools.Trial: 10000 samples with 334 evaluations.
@@ -99,3 +101,20 @@ ls_as_wkb = GFT.val(WKG.getwkb(ls))
 #  Memory estimate: 48 bytes, allocs estimate: 3.
 
 @b _get_geometry_tables(joinpath(dirname(@__DIR__), "test", "data", "polygon.gpkg")) seconds=3
+
+# Quick & easy linestring - ignore endianness for now
+function _easy(::Type{GT}, wkb::AbstractVector{UInt8}, ::Val{Z}, ::Val{M}) where {GT <: Union{GI.LineString, GI.LinearRing}, Z, M}
+    header = (1#=endianness=#+4#=geomtype=#+4#=srid.sth=#)
+    points = reinterpret(GI.Point{Z, M, Point{2+Z+M, Float64}, Nothing}, @view wkb[header+1:end])
+    return GT{Z, M, typeof(points), Nothing, Nothing}(
+        points,
+        nothing, 
+        nothing
+    )
+end
+
+_easy(GI.LineString, ls_as_wkb, (Val(false)), (Val(false)))
+
+@benchmark _easy(GI.LineString, $ls_as_wkb, $(Val(false)), $(Val(false)))
+
+function _easy_polygon(wkb::AbstractVector{UInt8}, ::Val{Z}, ::Val{M})
